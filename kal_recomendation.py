@@ -95,11 +95,15 @@ async def send_mix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if user_mix_mode[user_id] == 'top' and MIX_DATABASE:
-        # Получаем все миксы с положительным числом лайков
+        # Получаем все миксы с положительным числом лайков, за которые пользователь еще не голосовал
         liked_mixes = [
             (ingredients, data) 
             for ingredients, data in MIX_DATABASE.items() 
-            if data['likes'] > 0
+            if data['likes'] > 0 and (
+                user_id not in USER_DATABASE or 
+                ingredients not in USER_DATABASE[user_id] or 
+                (USER_DATABASE[user_id][ingredients]['likes'] == 0 and USER_DATABASE[user_id][ingredients]['dislikes'] == 0)
+            )
         ]
         
         if liked_mixes:
@@ -108,10 +112,12 @@ async def send_mix(update: Update, context: ContextTypes.DEFAULT_TYPE):
             proportions = mix_info['proportions']
             user_mix_mode[user_id] = 'random'  # Следующий будет случайный
         else:
-            # Если нет миксов с лайками, показываем случайный
+            # Если нет миксов с лайками, за которые пользователь еще не голосовал, показываем случайный
+            user_mix_mode[user_id] = 'random'  # Следующий будет случайный
             return await send_random_mix(update, context)
     else:
         # Показываем случайный микс
+        user_mix_mode[user_id] = 'top'  # Следующий будет топовый
         return await send_random_mix(update, context)
     
     sorted_mix = sorted(proportions.items(), key=lambda x: x[1], reverse=True)
@@ -139,6 +145,11 @@ async def send_random_mix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected_ingredients = random.sample(INGREDIENTS_POOL, 3)
     ingredients_set = frozenset(selected_ingredients)
 
+    # Проверяем, не голосовал ли уже пользователь за этот микс
+    if user_id in USER_DATABASE and ingredients_set in USER_DATABASE[user_id]:
+        # Если пользователь уже голосовал, генерируем новый микс
+        return await send_random_mix(update, context)
+
     if ingredients_set in MIX_DATABASE:
         # Если микс уже есть в базе, показываем его независимо от оценок
         mix_info = MIX_DATABASE[ingredients_set]
@@ -152,7 +163,7 @@ async def send_random_mix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if diff != 0:
             normalized[0] += diff
         proportions = {ingredient: percent for ingredient, percent in zip(selected_ingredients, normalized) if percent > 0}
-        # Не сохраняем новый микс в базу сразу, он будет сохранен только если получит лайк
+        # Не сохраняем новый микс в базу сразу, он будет сохранен только если получит оценку
         MIX_DATABASE[ingredients_set] = {"proportions": proportions, "likes": 0, "dislikes": 0}
 
     sorted_mix = sorted(proportions.items(), key=lambda x: x[1], reverse=True)
@@ -203,6 +214,16 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         print(f"Обработка {action} для микса: {ingredients}")  # Отладочная информация
         
+        # Проверяем, не голосовал ли уже пользователь за этот микс
+        if user_id in USER_DATABASE and ingredients in USER_DATABASE[user_id]:
+            user_vote = USER_DATABASE[user_id][ingredients]
+            if (action == "like" and user_vote['likes'] > 0) or (action == "dislike" and user_vote['dislikes'] > 0):
+                # Пользователь уже голосовал за этот микс
+                current_text = query.message.text
+                new_text = f"{current_text}\n\n❌ Вы уже голосовали за этот микс!"
+                await query.edit_message_text(text=new_text)
+                return
+        
         if ingredients in MIX_DATABASE:
             if action == "like":
                 MIX_DATABASE[ingredients]['likes'] += 1
@@ -232,7 +253,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if user_active.get(user_id, False):
                 # После любой оценки показываем микс из топа
-                user_mix_mode[user_id] = 'top'
+                #user_mix_mode[user_id] = 'top'
                 await send_mix(update, context)
             return
         else:
@@ -264,7 +285,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if user_active.get(user_id, False):
                     # После любой оценки показываем микс из топа
-                    user_mix_mode[user_id] = 'top'
+                    #user_mix_mode[user_id] = 'top'
                     await send_mix(update, context)
                 return
             else:
@@ -275,7 +296,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if user_active.get(user_id, False):
                     # После любой оценки показываем микс из топа
-                    user_mix_mode[user_id] = 'top'
+                    #user_mix_mode[user_id] = 'top'
                     await send_mix(update, context)
                 return
 
@@ -315,17 +336,21 @@ async def save_database_periodically():
             writer = csv.writer(csvfile)
             writer.writerow(["ingredients", "proportions", "likes", "dislikes"])
             for ingredients_set, data in MIX_DATABASE.items():
-                ingredients = ",".join(sorted(ingredients_set))
-                proportions = ";".join(f"{k}:{int(v)}" for k, v in data['proportions'].items())
-                writer.writerow([ingredients, proportions, data['likes'], data['dislikes']])
+                # Сохраняем только миксы с оценками
+                if data['likes'] > 0 or data['dislikes'] > 0:
+                    ingredients = ",".join(sorted(ingredients_set))
+                    proportions = ";".join(f"{k}:{int(v)}" for k, v in data['proportions'].items())
+                    writer.writerow([ingredients, proportions, data['likes'], data['dislikes']])
 
         with open(USER_DATABASE_FILE, "w", newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(["user_id", "ingredients", "likes", "dislikes"])
             for user_id, mixes in USER_DATABASE.items():
                 for ingredients_set, votes in mixes.items():
-                    ingredients = ",".join(sorted(ingredients_set))
-                    writer.writerow([user_id, ingredients, votes['likes'], votes['dislikes']])
+                    # Сохраняем только миксы с оценками
+                    if votes['likes'] > 0 or votes['dislikes'] > 0:
+                        ingredients = ",".join(sorted(ingredients_set))
+                        writer.writerow([user_id, ingredients, votes['likes'], votes['dislikes']])
 
         await asyncio.sleep(60)
 
@@ -363,7 +388,7 @@ async def mytop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sorted_user_mixes = sorted(filtered_mixes.items(), key=lambda item: item[1]['likes'], reverse=True)
     
     top_text = "\n\n".join(
-        f"{idx+1}. {', '.join(sorted(mix[0]))}: {mix[1]['likes']} 👍\n" +
+        f"{idx+1}. {', '.join(sorted(mix[0]))}: {MIX_DATABASE[mix[0]]['likes']} 👍 / {MIX_DATABASE[mix[0]]['dislikes']} 👎\n" +
         " | ".join(f"{ing} {perc}%" for ing, perc in sorted(MIX_DATABASE[mix[0]]['proportions'].items(), key=lambda x: x[1], reverse=True))
         for idx, mix in enumerate(sorted_user_mixes)
     )
